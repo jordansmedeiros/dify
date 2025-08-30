@@ -109,13 +109,10 @@ COPY --from=web-builder /app/web/public ./public
 COPY --from=web-builder /app/web/.next/standalone ./
 COPY --from=web-builder /app/web/.next/static ./.next/static
 
-# Build Sandbox
-WORKDIR /tmp
-RUN git clone https://github.com/langgenius/dify-sandbox.git sandbox \
-    && cd sandbox \
-    && go mod download \
-    && go build -o /usr/local/bin/sandbox \
-    && rm -rf /tmp/sandbox
+# Download Sandbox binary (evita problema de compilação Go)
+RUN wget -O /tmp/sandbox https://github.com/langgenius/dify-sandbox/releases/download/0.2.12/dify-sandbox-linux-amd64 \
+    && chmod +x /tmp/sandbox \
+    && mv /tmp/sandbox /usr/local/bin/sandbox
 
 # Setup SSRF Proxy config
 COPY docker/ssrf_proxy/ /etc/squid/

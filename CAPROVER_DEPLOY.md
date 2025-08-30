@@ -163,8 +163,23 @@ git push origin main
 
 1. Na aba "App Configs"
 2. Em "Persistent Directories", adicione:
-   - `/app/storage` - Para arquivos enviados
-   - `/app/logs` - Para logs da aplicação
+
+   **Primeira linha:**
+   - Caminho no App: `/app/storage`
+   - Rótulo: `storage`
+   - Definir caminho específico no host: (deixe vazio para usar padrão)
+
+   **Segunda linha:**
+   - Caminho no App: `/app/logs`
+   - Rótulo: `logs`
+   - Definir caminho específico no host: (deixe vazio para usar padrão)
+
+   **Terceira linha (opcional mas recomendado):**
+   - Caminho no App: `/var/lib/postgresql/data`
+   - Rótulo: `postgres-data`
+   - Definir caminho específico no host: (deixe vazio para usar padrão)
+   
+   > **Nota**: Os rótulos são importantes pois o CapRover usa eles para criar volumes Docker nomeados. Isso facilita backup e migração dos dados.
 
 ### Configurar Recursos
 

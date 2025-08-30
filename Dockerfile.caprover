@@ -1,0 +1,126 @@
+# Multi-stage build for Dify deployment on CapRover
+# This Dockerfile builds all components needed for Dify
+
+# ========================================
+# Stage 1: Build API/Worker dependencies
+# ========================================
+FROM python:3.12-slim-bookworm AS api-base
+
+WORKDIR /app/api
+
+# Install uv for package management
+ENV UV_VERSION=0.8.9
+RUN pip install --no-cache-dir uv==${UV_VERSION}
+
+# Install system dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc g++ libc-dev libffi-dev libgmp-dev libmpfr-dev libmpc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install Python dependencies
+COPY api/pyproject.toml api/uv.lock ./
+RUN uv sync --locked --no-dev
+
+# ========================================
+# Stage 2: Build Web frontend
+# ========================================
+FROM node:22-alpine3.21 AS web-builder
+
+RUN apk add --no-cache tzdata
+RUN corepack enable
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+
+WORKDIR /app/web
+
+# Copy package files
+COPY web/package.json web/pnpm-lock.yaml ./
+
+# Install dependencies
+RUN corepack install
+RUN pnpm install --frozen-lockfile
+
+# Copy source and build
+COPY web/ .
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+ENV NEXT_PUBLIC_BASE_PATH=""
+RUN pnpm build:docker
+
+# ========================================
+# Stage 3: Production image
+# ========================================
+FROM python:3.12-slim-bookworm
+
+# Install Node.js and system dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        gnupg \
+        supervisor \
+        nginx \
+        redis-server \
+        postgresql-client \
+        # Dependencies for API
+        libgmp-dev libmpfr-dev libmpc-dev \
+        fonts-noto-cjk \
+        media-types \
+        libmagic1 \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y nodejs \
+    && npm install -g pm2 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set environment variables
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV PYTHONIOENCODING=utf-8
+ENV TZ=UTC
+ENV FLASK_APP=app.py
+ENV EDITION=SELF_HOSTED
+ENV DEPLOY_ENV=PRODUCTION
+
+# Create directories
+RUN mkdir -p /app/api /app/web /app/storage /app/logs /var/log/supervisor
+
+# Copy Python environment from api-base
+ENV VIRTUAL_ENV=/app/api/.venv
+COPY --from=api-base ${VIRTUAL_ENV} ${VIRTUAL_ENV}
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# Copy API source code
+COPY api/ /app/api/
+WORKDIR /app/api
+
+# Download NLTK data
+RUN python -c "import nltk; nltk.download('punkt'); nltk.download('averaged_perceptron_tagger')"
+
+# Setup tiktoken cache
+ENV TIKTOKEN_CACHE_DIR=/app/api/.tiktoken_cache
+RUN python -c "import tiktoken; tiktoken.encoding_for_model('gpt2')"
+
+# Copy Web build from web-builder
+WORKDIR /app/web
+COPY --from=web-builder /app/web/public ./public
+COPY --from=web-builder /app/web/.next/standalone ./
+COPY --from=web-builder /app/web/.next/static ./.next/static
+
+# Copy configuration files
+COPY docker/nginx.conf /etc/nginx/sites-available/default
+COPY docker/supervisord.conf /etc/supervisor/conf.d/dify.conf
+COPY docker/start.sh /start.sh
+RUN chmod +x /start.sh
+
+# Expose ports
+EXPOSE 80
+
+# Set working directory
+WORKDIR /app
+
+# Entry point
+CMD ["/start.sh"]

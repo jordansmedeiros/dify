@@ -21,12 +21,18 @@ export DB_USERNAME=${DB_USERNAME:-postgres}
 export DB_PASSWORD=${DB_PASSWORD:-difyai123456}
 export DB_DATABASE=${DB_DATABASE:-dify}
 
-# API URLs configuration
-export CONSOLE_API_URL=${CONSOLE_API_URL:-http://127.0.0.1:5001}
-export CONSOLE_WEB_URL=${CONSOLE_WEB_URL:-http://127.0.0.1:3000}
-export SERVICE_API_URL=${SERVICE_API_URL:-http://127.0.0.1:5001}
-export APP_API_URL=${APP_API_URL:-http://127.0.0.1:5001}
-export APP_WEB_URL=${APP_WEB_URL:-http://127.0.0.1:3000}
+# API URLs configuration (baseado na documentação oficial)
+export CONSOLE_API_URL=${CONSOLE_API_URL:-}
+export CONSOLE_WEB_URL=${CONSOLE_WEB_URL:-}
+export SERVICE_API_URL=${SERVICE_API_URL:-}
+export APP_API_URL=${APP_API_URL:-}
+export APP_WEB_URL=${APP_WEB_URL:-}
+
+# Frontend específico (Next.js)
+export NEXT_PUBLIC_API_PREFIX=${CONSOLE_API_URL}/console/api
+export NEXT_PUBLIC_PUBLIC_API_PREFIX=${SERVICE_API_URL}/api
+export NEXT_PUBLIC_DEPLOY_ENV=PRODUCTION
+export NEXT_PUBLIC_EDITION=SELF_HOSTED
 
 # Files URL configuration
 export FILES_URL=${FILES_URL:-}

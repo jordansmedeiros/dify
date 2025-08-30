@@ -1,0 +1,65 @@
+# Dockerfile para Dify Frontend - Next.js completo
+FROM node:22-alpine3.21 AS base
+
+RUN apk add --no-cache tzdata
+RUN corepack enable
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+
+WORKDIR /app/web
+
+# Copy package files
+COPY web/package.json web/pnpm-lock.yaml ./
+
+# Install dependencies
+RUN corepack install
+RUN pnpm install --frozen-lockfile
+
+# Copy source code
+COPY web/ .
+
+# Build configuration
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+ENV NEXT_PUBLIC_BASE_PATH=""
+
+# Build the application
+RUN pnpm build:docker
+
+# Production stage
+FROM node:22-alpine3.21 AS production
+
+ENV NODE_ENV=production
+ENV EDITION=SELF_HOSTED
+ENV DEPLOY_ENV=PRODUCTION
+ENV PORT=3000
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# Set timezone
+ENV TZ=UTC
+RUN ln -s /usr/share/zoneinfo/${TZ} /etc/localtime \
+    && echo ${TZ} > /etc/timezone
+
+WORKDIR /app/web
+
+# Copy built application
+COPY --from=base /app/web/public ./public
+COPY --from=base /app/web/.next/standalone ./
+COPY --from=base /app/web/.next/static ./.next/static
+
+# Install PM2 globally
+RUN npm install -g pm2
+
+# Create startup script
+COPY dockerfiles/start.frontend.sh /start.sh
+RUN chmod +x /start.sh
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs
+RUN adduser -S nextjs -u 1001
+
+# Change ownership
+RUN chown -R nextjs:nodejs /app/web
+USER nextjs
+
+EXPOSE 3000
+CMD ["/start.sh"]

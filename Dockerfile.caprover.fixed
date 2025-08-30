@@ -1,0 +1,261 @@
+# Dockerfile corrigido para Dify no CapRover
+# Inclui TODOS os serviços necessários sem nginx duplicado
+
+# ========================================
+# Stage 1: Build API/Worker dependencies
+# ========================================
+FROM python:3.12-slim-bookworm AS api-base
+
+WORKDIR /app/api
+
+# Install uv
+ENV UV_VERSION=0.8.9
+RUN pip install --no-cache-dir uv==${UV_VERSION}
+
+# Install system dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc g++ libc-dev libffi-dev libgmp-dev libmpfr-dev libmpc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install Python dependencies
+COPY api/pyproject.toml api/uv.lock ./
+RUN uv sync --locked --no-dev
+
+# ========================================
+# Stage 2: Build Web frontend
+# ========================================
+FROM node:22-alpine3.21 AS web-builder
+
+RUN apk add --no-cache tzdata
+RUN corepack enable
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+
+WORKDIR /app/web
+COPY web/package.json web/pnpm-lock.yaml ./
+RUN corepack install
+RUN pnpm install --frozen-lockfile
+
+COPY web/ .
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+ENV NEXT_PUBLIC_BASE_PATH=""
+RUN pnpm build:docker
+
+# ========================================
+# Stage 3: Production - TODOS OS SERVIÇOS
+# ========================================
+FROM python:3.12-slim-bookworm
+
+# Install ALL dependencies including Go for sandbox
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl ca-certificates gnupg supervisor \
+        redis-server postgresql-client squid \
+        # API dependencies
+        libgmp-dev libmpfr-dev libmpc-dev fonts-noto-cjk media-types libmagic1 \
+        # Go for sandbox
+        golang-go \
+        # Node.js for web
+        wget \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y nodejs \
+    && npm install -g pm2 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Weaviate
+RUN wget -O /usr/local/bin/weaviate https://github.com/weaviate/weaviate/releases/download/v1.19.0/weaviate-v1.19.0-linux-amd64.tar.gz \
+    && tar -xzf /usr/local/bin/weaviate -C /usr/local/bin/ \
+    && chmod +x /usr/local/bin/weaviate \
+    && rm /usr/local/bin/weaviate
+
+# Set environment variables
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV PYTHONIOENCODING=utf-8
+ENV TZ=UTC
+ENV FLASK_APP=app.py
+ENV EDITION=SELF_HOSTED
+ENV DEPLOY_ENV=PRODUCTION
+
+# Create directories
+RUN mkdir -p /app/api /app/web /app/storage /app/logs /app/sandbox /app/weaviate /var/log/supervisor
+
+# Copy Python environment
+ENV VIRTUAL_ENV=/app/api/.venv
+COPY --from=api-base ${VIRTUAL_ENV} ${VIRTUAL_ENV}
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# Copy API source
+COPY api/ /app/api/
+WORKDIR /app/api
+
+# Download NLTK data
+RUN python -c "import nltk; nltk.download('punkt'); nltk.download('averaged_perceptron_tagger')"
+
+# Setup tiktoken cache
+ENV TIKTOKEN_CACHE_DIR=/app/api/.tiktoken_cache
+RUN python -c "import tiktoken; tiktoken.encoding_for_model('gpt2')"
+
+# Copy Web build
+WORKDIR /app/web
+COPY --from=web-builder /app/web/public ./public
+COPY --from=web-builder /app/web/.next/standalone ./
+COPY --from=web-builder /app/web/.next/static ./.next/static
+
+# Build Sandbox (Go application)
+WORKDIR /app/sandbox
+RUN git clone https://github.com/langgenius/dify-sandbox.git . \
+    && go mod download \
+    && go build -o sandbox
+
+# Copy SSRF Proxy config
+COPY docker/ssrf_proxy/ /etc/squid/
+
+# Create supervisor configuration for ALL services
+RUN cat > /etc/supervisor/conf.d/dify.conf << 'EOF'
+[supervisord]
+nodaemon=true
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
+user=root
+
+[program:redis]
+command=redis-server --requirepass %(ENV_REDIS_PASSWORD)s --port 6379
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/redis.log
+stderr_logfile=/var/log/supervisor/redis.err
+
+[program:weaviate]
+command=/usr/local/bin/weaviate --host 0.0.0.0 --port 8080 --scheme http
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/weaviate.log
+stderr_logfile=/var/log/supervisor/weaviate.err
+environment=PERSISTENCE_DATA_PATH="/app/weaviate"
+
+[program:ssrf_proxy]
+command=squid -N -f /etc/squid/squid.conf
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/squid.log
+stderr_logfile=/var/log/supervisor/squid.err
+
+[program:sandbox]
+command=/app/sandbox/sandbox
+directory=/app/sandbox
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/sandbox.log
+stderr_logfile=/var/log/supervisor/sandbox.err
+environment=API_KEY="%(ENV_SANDBOX_API_KEY)s",GIN_MODE="release",WORKER_TIMEOUT="15"
+
+[program:api]
+command=gunicorn --bind 0.0.0.0:5001 --workers %(ENV_SERVER_WORKER_AMOUNT)s --worker-class %(ENV_SERVER_WORKER_CLASS)s --timeout %(ENV_GUNICORN_TIMEOUT)s --preload app:app
+directory=/app/api
+environment=MODE="api"
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/api.log
+stderr_logfile=/var/log/supervisor/api.err
+
+[program:worker]
+command=celery -A app.celery worker -Q %(ENV_CELERY_QUEUES)s --loglevel INFO
+directory=/app/api
+environment=MODE="worker"
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/worker.log
+stderr_logfile=/var/log/supervisor/worker.err
+
+[program:beat]
+command=celery -A app.celery beat --loglevel INFO
+directory=/app/api
+environment=MODE="beat"
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/beat.log
+stderr_logfile=/var/log/supervisor/beat.err
+
+[program:web]
+command=pm2-runtime start server.js --instances %(ENV_PM2_INSTANCES)s
+directory=/app/web
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/web.log
+stderr_logfile=/var/log/supervisor/web.err
+EOF
+
+# Create startup script
+RUN cat > /start.sh << 'EOF'
+#!/bin/bash
+set -e
+
+# Set default values
+export REDIS_PASSWORD=${REDIS_PASSWORD:-difyai123456}
+export SERVER_WORKER_AMOUNT=${SERVER_WORKER_AMOUNT:-1}
+export SERVER_WORKER_CLASS=${SERVER_WORKER_CLASS:-gevent}
+export GUNICORN_TIMEOUT=${GUNICORN_TIMEOUT:-360}
+export PM2_INSTANCES=${PM2_INSTANCES:-2}
+export CELERY_QUEUES=${CELERY_QUEUES:-dataset,generation,mail,ops_trace,app_deletion}
+export SANDBOX_API_KEY=${SANDBOX_API_KEY:-dify-sandbox}
+
+# Database configuration
+export DB_HOST=${DB_HOST:-postgres}
+export DB_PORT=${DB_PORT:-5432}
+export DB_USERNAME=${DB_USERNAME:-postgres}
+export DB_PASSWORD=${DB_PASSWORD:-difyai123456}
+export DB_DATABASE=${DB_DATABASE:-dify}
+
+# Redis configuration (local)
+export REDIS_HOST=127.0.0.1
+export REDIS_PORT=6379
+export CELERY_BROKER_URL="redis://:${REDIS_PASSWORD}@127.0.0.1:6379/1"
+
+# Weaviate configuration (local)
+export WEAVIATE_ENDPOINT=http://127.0.0.1:8080
+export WEAVIATE_API_KEY=WVF5YThaHlkYwhGUSmCRgsX3tD5ngdN8pkih
+
+# Sandbox configuration (local)
+export CODE_EXECUTION_ENDPOINT=http://127.0.0.1:8194
+export CODE_EXECUTION_API_KEY=dify-sandbox
+
+# SSRF Proxy configuration (local)
+export SSRF_PROXY_HTTP_URL=http://127.0.0.1:3128
+export SSRF_PROXY_HTTPS_URL=http://127.0.0.1:3128
+
+# Wait for external PostgreSQL
+if [ "$DB_HOST" != "127.0.0.1" ] && [ "$DB_HOST" != "localhost" ]; then
+    echo "Waiting for PostgreSQL to be ready..."
+    until pg_isready -h $DB_HOST -p $DB_PORT -U $DB_USERNAME; do
+        echo "PostgreSQL is not ready yet..."
+        sleep 2
+    done
+    echo "PostgreSQL is ready!"
+fi
+
+# Run migrations
+if [ "$MIGRATION_ENABLED" = "true" ]; then
+    echo "Running database migrations..."
+    cd /app/api
+    flask db upgrade
+    echo "Migrations completed!"
+fi
+
+# Start supervisor with ALL services
+echo "Starting ALL Dify services..."
+exec /usr/bin/supervisord -c /etc/supervisor/conf.d/dify.conf
+EOF
+
+RUN chmod +x /start.sh
+
+# Expose port 5001 (API) - CapRover fará proxy direto
+EXPOSE 5001
+
+WORKDIR /app
+CMD ["/start.sh"]

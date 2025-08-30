@@ -1,0 +1,134 @@
+# Dockerfile MONOLÍTICO - Dify COMPLETO em um container
+# Inclui: API + Workers + Frontend + Redis + Weaviate + Sandbox + Plugin Daemon
+
+# ========================================
+# Stage 1: Build API dependencies
+# ========================================
+FROM python:3.12-slim-bookworm AS api-base
+
+WORKDIR /app/api
+
+# Install uv
+ENV UV_VERSION=0.8.9
+RUN pip install --no-cache-dir uv==${UV_VERSION}
+
+# Install system dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc g++ libc-dev libffi-dev libgmp-dev libmpfr-dev libmpc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install Python dependencies
+COPY api/pyproject.toml api/uv.lock ./
+RUN uv sync --locked --no-dev
+
+# ========================================
+# Stage 2: Build Web frontend
+# ========================================
+FROM node:22-alpine3.21 AS web-builder
+
+RUN apk add --no-cache tzdata
+RUN corepack enable
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+
+WORKDIR /app/web
+COPY web/package.json web/pnpm-lock.yaml ./
+RUN corepack install
+RUN pnpm install --frozen-lockfile
+
+COPY web/ .
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+ENV NEXT_PUBLIC_BASE_PATH=""
+RUN pnpm build:docker
+
+# ========================================
+# Stage 3: MONOLÍTICO - TUDO INCLUÍDO
+# ========================================
+FROM python:3.12-slim-bookworm
+
+# Install TODAS as dependências
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl ca-certificates gnupg supervisor squid git wget \
+        # API dependencies
+        libgmp-dev libmpfr-dev libmpc-dev fonts-noto-cjk media-types libmagic1 \
+        postgresql-client \
+        # Redis
+        redis-server \
+        # Go para Sandbox
+        golang-go \
+        # Java para Weaviate
+        openjdk-17-jre-headless \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y nodejs \
+    && npm install -g pm2 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Weaviate binary
+RUN wget -O /tmp/weaviate.tar.gz https://github.com/weaviate/weaviate/releases/download/v1.19.0/weaviate-v1.19.0-linux-amd64.tar.gz \
+    && tar -xzf /tmp/weaviate.tar.gz -C /usr/local/bin/ \
+    && chmod +x /usr/local/bin/weaviate \
+    && rm /tmp/weaviate.tar.gz
+
+# Set environment variables
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV PYTHONIOENCODING=utf-8
+ENV TZ=UTC
+ENV FLASK_APP=app.py
+ENV EDITION=SELF_HOSTED
+ENV DEPLOY_ENV=PRODUCTION
+
+# Create all directories
+RUN mkdir -p /app/api /app/web /app/storage /app/logs /app/sandbox /app/weaviate /var/log/supervisor /etc/squid
+
+# Copy Python environment
+ENV VIRTUAL_ENV=/app/api/.venv
+COPY --from=api-base ${VIRTUAL_ENV} ${VIRTUAL_ENV}
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# Copy API source
+COPY api/ /app/api/
+WORKDIR /app/api
+
+# Download NLTK data
+RUN python -c "import nltk; nltk.download('punkt'); nltk.download('averaged_perceptron_tagger')"
+
+# Setup tiktoken cache
+ENV TIKTOKEN_CACHE_DIR=/app/api/.tiktoken_cache
+RUN python -c "import tiktoken; tiktoken.encoding_for_model('gpt2')"
+
+# Copy Web build
+WORKDIR /app/web
+COPY --from=web-builder /app/web/public ./public
+COPY --from=web-builder /app/web/.next/standalone ./
+COPY --from=web-builder /app/web/.next/static ./.next/static
+
+# Build Sandbox
+WORKDIR /tmp
+RUN git clone https://github.com/langgenius/dify-sandbox.git sandbox \
+    && cd sandbox \
+    && go mod download \
+    && go build -o /usr/local/bin/sandbox \
+    && rm -rf /tmp/sandbox
+
+# Setup SSRF Proxy config
+COPY docker/ssrf_proxy/ /etc/squid/
+
+# Create supervisor configuration - TODOS OS SERVIÇOS
+COPY dockerfiles/supervisord.monolithic.conf /etc/supervisor/conf.d/dify.conf
+
+# Create startup script
+COPY dockerfiles/start.monolithic.sh /start.sh
+RUN chmod +x /start.sh
+
+# Expose port 5001 (API principal)
+EXPOSE 5001
+
+WORKDIR /app
+CMD ["/start.sh"]

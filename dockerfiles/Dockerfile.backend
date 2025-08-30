@@ -1,0 +1,76 @@
+# Dockerfile para Dify Backend - API + Workers + Sandbox + Plugin Daemon
+FROM python:3.12-slim-bookworm AS base
+
+WORKDIR /app/api
+
+# Install uv
+ENV UV_VERSION=0.8.9
+RUN pip install --no-cache-dir uv==${UV_VERSION}
+
+# Install system dependencies for API + Sandbox + Plugin Daemon
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc g++ libc-dev libffi-dev libgmp-dev libmpfr-dev libmpc-dev \
+        curl postgresql-client supervisor squid git \
+        # API dependencies
+        fonts-noto-cjk media-types libmagic1 \
+        # Go for sandbox
+        golang-go \
+        # Plugin daemon needs
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install Python dependencies
+COPY api/pyproject.toml api/uv.lock ./
+RUN uv sync --locked --no-dev
+
+# Set environment variables
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV PYTHONIOENCODING=utf-8
+ENV TZ=UTC
+ENV FLASK_APP=app.py
+ENV EDITION=SELF_HOSTED
+ENV DEPLOY_ENV=PRODUCTION
+
+# Copy Python environment
+ENV VIRTUAL_ENV=/app/api/.venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# Copy API source code
+COPY api/ /app/api/
+WORKDIR /app/api
+
+# Download NLTK data
+RUN python -c "import nltk; nltk.download('punkt'); nltk.download('averaged_perceptron_tagger')"
+
+# Setup tiktoken cache
+ENV TIKTOKEN_CACHE_DIR=/app/api/.tiktoken_cache
+RUN python -c "import tiktoken; tiktoken.encoding_for_model('gpt2')"
+
+# Build Sandbox
+WORKDIR /tmp
+RUN git clone https://github.com/langgenius/dify-sandbox.git sandbox \
+    && cd sandbox \
+    && go mod download \
+    && go build -o /usr/local/bin/sandbox \
+    && rm -rf /tmp/sandbox
+
+# Setup SSRF Proxy
+RUN mkdir -p /etc/squid
+COPY docker/ssrf_proxy/ /etc/squid/
+
+# Create supervisor configuration
+RUN mkdir -p /var/log/supervisor
+COPY dockerfiles/supervisord.backend.conf /etc/supervisor/conf.d/dify.conf
+
+# Create startup script
+COPY dockerfiles/start.backend.sh /start.sh
+RUN chmod +x /start.sh
+
+# Create storage directories
+RUN mkdir -p /app/storage /app/logs
+
+WORKDIR /app/api
+EXPOSE 5001
+CMD ["/start.sh"]

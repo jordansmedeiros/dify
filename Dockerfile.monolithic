@@ -43,7 +43,12 @@ ENV NEXT_PUBLIC_BASE_PATH=""
 RUN pnpm build:docker
 
 # ========================================
-# Stage 3: MONOLÍTICO - TUDO INCLUÍDO
+# Stage 3: Sandbox (copia da imagem oficial)
+# ========================================
+FROM langgenius/dify-sandbox:0.2.12 AS sandbox
+
+# ========================================
+# Stage 4: MONOLÍTICO - TUDO INCLUÍDO
 # ========================================
 FROM python:3.12-slim-bookworm
 
@@ -109,13 +114,11 @@ COPY --from=web-builder /app/web/public ./public
 COPY --from=web-builder /app/web/.next/standalone ./
 COPY --from=web-builder /app/web/.next/static ./.next/static
 
-# Download Sandbox binary (evita problema de compilação Go)
-RUN wget -O /tmp/sandbox https://github.com/langgenius/dify-sandbox/releases/download/0.2.12/dify-sandbox-linux-amd64 \
-    && chmod +x /tmp/sandbox \
-    && mv /tmp/sandbox /usr/local/bin/sandbox
-
 # Setup SSRF Proxy config
 COPY docker/ssrf_proxy/ /etc/squid/
+
+# Copy sandbox binary from official image
+COPY --from=langgenius/dify-sandbox:0.2.12 /app/sandbox /usr/local/bin/sandbox
 
 # Create supervisor configuration - TODOS OS SERVIÇOS
 COPY dockerfiles/supervisord.monolithic.conf /etc/supervisor/conf.d/dify.conf
